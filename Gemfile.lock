@@ -1,0 +1,35 @@
+GEM
+  remote: https://rubygems.org/
+  specs:
+    builder (3.2.2)
+    coderay (1.1.1)
+    harvested (3.1.1)
+      hashie
+      httparty
+      json
+    hashie (3.4.3)
+    httparty (0.13.7)
+      json (~> 1.8)
+      multi_xml (>= 0.5.2)
+    json (1.8.3)
+    method_source (0.8.2)
+    multi_xml (0.5.5)
+    pry (0.10.3)
+      coderay (~> 1.1.0)
+      method_source (~> 0.8.1)
+      slop (~> 3.4)
+    ruby-freshbooks (0.4.1)
+      builder (>= 2.1.2)
+      httparty (>= 0.5.0)
+    slop (3.6.0)
+
+PLATFORMS
+  ruby
+
+DEPENDENCIES
+  harvested
+  pry
+  ruby-freshbooks
+
+BUNDLED WITH
+   1.11.2

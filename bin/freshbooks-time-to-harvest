@@ -1,0 +1,266 @@
+#!/usr/bin/env ruby
+
+ENV['BUNDLE_GEMFILE'] = File.expand_path('../../Gemfile', __FILE__)
+require 'bundler/setup'
+
+require 'harvested'
+require 'ruby-freshbooks'
+
+require 'pry'
+
+HARVEST_SUBDOMAIN = ENV.fetch('HARVEST_SUBDOMAIN')
+HARVEST_USERNAME = ENV.fetch('HARVEST_USERNAME')
+HARVEST_PASSWORD = ENV.fetch('HARVEST_PASSWORD')
+
+FRESHBOOKS_SUBDOMAIN = ENV.fetch('FRESHBOOKS_SUBDOMAIN')
+FRESHBOOKS_API_KEY = ENV.fetch('FRESHBOOKS_API_KEY')
+
+class BaseMatcher
+  def initialize(match_value)
+    @match_value = match_value
+  end
+
+  def matches?(test_value)
+    return true if @match_value.nil?
+    test(@match_value, convert_value(test_value))
+  end
+
+  private
+
+  def test(matcher_value, test_value)
+    matcher_value == test_value
+  end
+
+  def convert_value(test_value)
+    test_value
+  end
+
+  def hash
+    [self.class, @match_value].hash
+  end
+end
+
+class NumericMatcher < BaseMatcher
+  def convert_value(test_value)
+    fail 'Does not appear to be a number' unless /\d+/.match(test_value)
+    test_value.to_i
+  end
+end
+
+class PatternMatcher < BaseMatcher
+  def test(matcher_value, test_value)
+    matcher_value =~ test_value
+  end
+end
+
+class FreshbookTimeEntryRule
+  def initialize(name, staff_id: nil, project_id: nil, task_id: nil, billed: nil, notes: nil)
+    @name = name
+    @props = {
+      staff_id: NumericMatcher.new(staff_id),
+      project_id: NumericMatcher.new(project_id),
+      task_id: NumericMatcher.new(task_id),
+      billed: BaseMatcher.new(billed),
+      notes: PatternMatcher.new(notes),
+    }
+  end
+
+  attr_reader :name, :props
+
+  def hash
+    props.hash
+  end
+
+  def matches?(freshbook_time_entry)
+    @props.each_pair.all? do |(key, matcher)|
+      value = freshbook_time_entry.fetch(key.to_s)
+      matcher.matches?(value)
+    end
+  end
+end
+
+class TimeEntryMap
+  def initialize
+    @map = {}
+  end
+
+  def map(name:, from:, to:)
+    freshbooks_props, harvest_props = from, to
+    rule = FreshbookTimeEntryRule.new(name, **freshbooks_props)
+    fail "already defined rule: #{rule}" if @map.key?(rule)
+    @map[rule] = harvest_props
+  end
+
+  def match_freshbooks_time_entry(freshbook_time_entry)
+    @map.detect do |(rule, _)|
+      rule.matches?(freshbook_time_entry)
+    end
+  end
+end
+
+class TimeEntry
+  def initialize(freshbooks_time_entry, harvest_details)
+    @freshbooks_time_entry, @harvest_details = freshbooks_time_entry, harvest_details
+  end
+
+  attr_reader :freshbooks_time_entry
+
+  def harvest_time_entry_details
+    @harvest_details.merge(
+      spent_at: date,
+      hours: @freshbooks_time_entry.fetch('hours'),
+      notes: [@freshbooks_time_entry.fetch('notes'), "(from FreshBooks time entry ##{@freshbooks_time_entry.fetch('time_entry_id')})"].compact.join(' '),
+    )
+  end
+
+  def date
+    Date.parse(@freshbooks_time_entry.fetch('date'))
+  end
+
+  def matches_harvest_entry?(candidate_time_entry)
+    harvest_time_entry_details.each_pair.all? do |(key, expected_value)|
+      compare_harvest_values(key, expected_value, candidate_time_entry.fetch(key.to_s))
+    end
+  end
+
+  def compare_harvest_values(key, expected_value, candidate_value)
+    case key
+    when :spent_at
+      expected_value == candidate_value
+    when :project_id, :task_id
+      expected_value.to_i == candidate_value.to_i
+    when :hours
+      (expected_value.to_f - candidate_value.to_f).abs < 0.01
+    when :notes
+      expected_value == candidate_value
+    else
+      fail "unsure how to compare Harvest time entry property '#{key}'"
+    end
+  end
+end
+
+class FreshbooksTimeToHarvest
+  def initialize(freshbooks_client, harvest_client, starting_date)
+    @freshbooks, @harvest = freshbooks_client, harvest_client
+    @starting_date = starting_date
+    @time_entry_map = TimeEntryMap.new
+  end
+
+  attr_reader :freshbooks, :harvest
+
+  def freshbooks_time
+    return @freshbooks_time if defined?(@freshbooks_time)
+
+    STDERR.print 'Loading time from Freshbooks...'
+
+    @freshbooks_time = []
+    each_freshbooks_time_entry do |time_entry|
+      STDERR.putc ?.
+      next unless time_entry['hours'].to_f >= 0.01 # time == 0 will start a timer !! not good
+      matched_rule, harvest_props = @time_entry_map.match_freshbooks_time_entry(time_entry)
+      unless matched_rule
+        STDERR.print "\n"
+        next
+      end
+      @freshbooks_time << TimeEntry.new(time_entry, harvest_props)
+    end
+    STDERR.print "\n"
+    @freshbooks_time
+  end
+
+  def freshbooks_time_by_date
+    @freshbooks_time_by_date ||= freshbooks_time.inject(Hash.new { |h,k| h[k] = [] }) do |grouped, time_entry|
+      grouped[time_entry.date] << time_entry
+      grouped
+    end
+  end
+
+  def run
+    freshbooks_time
+    warn '---'
+    @starting_date.upto(Date.today).each do |date|
+      STDERR.print date.to_s
+
+      fresh_time_entries = freshbooks_time_by_date[date]
+      harvest_time = harvest.time.all(date)
+
+      # p harvest_time: harvest_time if harvest_time.any?
+      # p fresh_time: fresh_time_entries.map { |te| te.freshbooks_time_entry['hours'] } if fresh_time_entries.any?
+
+      to_add = []
+      to_delete = []
+      matched_existing = []
+
+      fresh_time_entries.each do |te|
+        matched_harvest_time_entry = (harvest_time - matched_existing).detect do |harvest_time_entry|
+          te.matches_harvest_entry?(harvest_time_entry)
+        end
+
+        if matched_harvest_time_entry
+          # p match: [te, matched_harvest_time_entry]
+          matched_existing << matched_harvest_time_entry
+        else
+          to_add << te.harvest_time_entry_details
+        end
+      end
+
+      to_delete = harvest_time - matched_existing
+
+      STDERR.print " (#{matched_existing.length} matched time entries already exist)" if matched_existing.length > 0
+      STDERR.print "\n"
+
+      # p matched_existing: matched_existing
+      # p to_delete: to_delete
+      # p to_add: to_add
+
+      to_delete.each do |h_time_entry|
+        warn "  Deleting Harvest entry #{h_time_entry.id}"
+        harvest.time.delete(h_time_entry)
+      end
+
+      to_add.each do |time_entry|
+        warn "  Adding Harvest entry #{time_entry}"
+        harvest.time.create(time_entry)
+      end
+    end
+
+  #   binding.pry
+  # rescue => ex
+  #   binding.pry
+  end
+
+  def load_map_config(file)
+    @time_entry_map.instance_eval File.read(file), file
+  end
+
+  def each_freshbooks_time_entry(&block)
+    page = 1
+    loop do
+      response = freshbooks.time_entry.list(page: page)['time_entries']
+      response['time_entry'].each do |time_entry|
+        return if Date.parse(time_entry['date']) < @starting_date
+        block.call(time_entry)
+      end
+
+      return if response['page'].to_i >= response['pages'].to_i
+      page += 1
+    end
+  end
+end
+
+harvest = Harvest.hardy_client(
+  subdomain: HARVEST_SUBDOMAIN,
+  username: HARVEST_USERNAME,
+  password: HARVEST_PASSWORD)
+
+freshbooks = FreshBooks::Client.new(FRESHBOOKS_SUBDOMAIN, FRESHBOOKS_API_KEY)
+
+unless ARGV[0]
+  fail 'Must give a Start Date argument'
+end
+
+start_date = Date.parse(ARGV[0])
+
+cmd = FreshbooksTimeToHarvest.new(freshbooks, harvest, start_date)
+cmd.load_map_config('mapping.rb')
+cmd.run
